@@ -20,7 +20,12 @@ class AdminValidator:
     
     def __init__(self, config: Config):
         self.config = config
-        self.jira = JiraAPI(config) if config.jira_token else None
+
+        # ✅ New auth check: Cloud Basic OR Server/DC Bearer
+        has_jira_creds = bool(
+            (config.jira_email and config.jira_api_token) or config.jira_bearer_token
+        )
+        self.jira = JiraAPI(config) if has_jira_creds else None
         
         # System prompt for AI validation
         self.system_prompt = """You are a Jira admin who validates field requests and can auto-create approved fields.
@@ -105,11 +110,12 @@ Format: Return ONLY valid JSON:
             
             # Step 4: Auto-create field if approved
             field_creation_result = None
-            if (self.jira and 
+            if (
+                self.jira and 
                 ai_result.get("status") == "approved" and 
                 ai_result.get("auto_create") and
-                ai_result.get("field_name")):
-                
+                ai_result.get("field_name")
+            ):
                 logger.info("🚀 Auto-creating field as requested by AI...")
                 field_creation_result = self._auto_create_field(ai_result)
                 
@@ -246,7 +252,7 @@ If APPROVED and you have all needed info, set auto_create=true to create the fie
                 field_name=ai_result["field_name"],
                 field_type=ai_result.get("field_type", "text"),
                 description=ai_result.get("field_description", f"Auto-created: {ai_result['field_name']}"),
-                options=ai_result.get("field_options", [])
+                options=ai_result.get("field_options", []),
             )
         except Exception as e:
             logger.error(f"❌ Field creation error: {e}")

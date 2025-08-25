@@ -118,3 +118,7 @@ class FieldExtractor:
             field_name = ' '.join(words[:4])
         
         return field_name
+
+# Create a standalone function for backward compatibility
+_extractor = FieldExtractor()
+extract_field_details = _extractor.extract_field_details

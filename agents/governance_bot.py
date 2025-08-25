@@ -18,7 +18,11 @@ class GovernanceBot:
     
     def __init__(self, config: Config):
         self.config = config
-        self.jira = JiraAPI(config) if config.jira_token else None
+        # ✅ Cloud Basic OR Server/DC Bearer
+        has_jira_creds = bool(
+            (config.jira_email and config.jira_api_token) or config.jira_bearer_token
+        )
+        self.jira = JiraAPI(config) if has_jira_creds else None
         
         # System prompt for governance
         self.system_prompt = """You maintain Jira hygiene and enforce conventions automatically.
@@ -164,9 +168,6 @@ Format: Return ONLY valid JSON:
                 "description": "Ticket has no priority set",
                 "recommendation": "Set appropriate priority level"
             })
-        
-        # Check for stale status (if we can determine last update)
-        # This would require additional API calls to get issue history
         
         # Check summary quality
         summary = fields.get("summary", "")

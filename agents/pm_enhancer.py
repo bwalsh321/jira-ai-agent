@@ -14,11 +14,15 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 class PMEnhancer:
-    """AI agent that transforms meeting notes and messy tickets into professional user stories"""
+    """AI agent that transforms meeting notes and messy ticket descriptions into professional user stories"""
     
     def __init__(self, config: Config):
         self.config = config
-        self.jira = JiraAPI(config) if config.jira_token else None
+        # ✅ Cloud Basic OR Server/DC Bearer
+        has_jira_creds = bool(
+            (config.jira_email and config.jira_api_token) or config.jira_bearer_token
+        )
+        self.jira = JiraAPI(config) if has_jira_creds else None
         
         # System prompt for PM enhancement
         self.system_prompt = """You transform meeting notes, brain dumps, and messy ticket descriptions into professional Jira stories.
