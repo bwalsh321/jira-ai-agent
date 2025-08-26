@@ -1,6 +1,5 @@
 """
-Admin Validator Agent - Validates and auto-creates Jira custom fields
-Migrated from monolithic script with enhancements
+Admin Validator Agent - Updated with more practical validation approach
 """
 
 from typing import Dict, List, Optional, Any
@@ -16,42 +15,60 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 class AdminValidator:
-    """AI agent that validates admin requests and can auto-create approved fields"""
+    """AI agent that validates admin requests with practical, workflow-aware approach"""
     
     def __init__(self, config: Config):
         self.config = config
 
-        # ✅ New auth check: Cloud Basic OR Server/DC Bearer
+        # Cloud Basic OR Server/DC Bearer
         has_jira_creds = bool(
             (config.jira_email and config.jira_api_token) or config.jira_bearer_token
         )
         self.jira = JiraAPI(config) if has_jira_creds else None
         
-        # System prompt for AI validation
-        self.system_prompt = """You are a Jira admin who validates field requests and can auto-create approved fields.
+        # Updated system prompt - more practical and less rigid
+        self.system_prompt = """You are a practical Jira admin who validates field requests efficiently and reasonably.
 
 INPUT: Field creation request with duplicate check results and extracted details
 OUTPUT: Validation decision with optional auto-creation
 
-You check for:
-- Real duplicate conflicts (based on actual Jira data provided)
-- Naming convention compliance 
-- Missing required information for implementation
-- Security or compliance concerns
+VALIDATION APPROACH - Be practical, not pedantic:
 
-When request is APPROVED and has all needed info, you can auto-create the field.
-When REJECTED or NEEDS_INFO, explain what's missing.
+APPROVE AND AUTO-CREATE when:
+- Simple field requests with clear names and no exact duplicates
+- Basic text fields, even without detailed descriptions
+- Reasonable field names that follow basic conventions
+- Similar fields exist but serve different purposes
+
+FLAG FOR REVIEW (needs_info) only when:
+- Select fields requested without any options specified
+- Field names are vague/unclear (like "Field1" or "Test")
+- Potential security/compliance concerns
+- Complex custom field types that need clarification
+
+REJECT only when:
+- Exact duplicate field already exists with same purpose
+- Field name violates clear naming standards
+- Request is genuinely inappropriate or nonsensical
+
+PRACTICAL RULES:
+- Missing descriptions are fine - generate reasonable ones
+- Don't require extensive documentation for simple requests
+- Trust the requester's judgment on field necessity
+- Focus on preventing actual problems, not enforcing bureaucracy
+- Auto-approve 80% of reasonable requests
+- Keep humans in the loop for genuinely complex cases
 
 Format: Return ONLY valid JSON:
 {
-  "status": "approved|rejected|needs_info",
+  "status": "approved|needs_info|rejected",
   "auto_create": true|false,
-  "field_name": "Cleaned up field name",
+  "field_name": "Cleaned field name",
   "field_type": "select|text|textarea|number|date|multiselect",
-  "field_description": "Professional description for the field",
-  "field_options": ["Option1", "Option2", "Option3"],
-  "issues": ["List of problems found"],
-  "suggestions": ["Alternative approaches or improvements"],
+  "field_description": "Professional but concise description (auto-generate if missing)",
+  "field_options": ["Option1", "Option2"] or [],
+  "reasoning": "Brief explanation of decision",
+  "workflow_note": "Any guidance for admin workflow",
   "comment": "Professional explanation for the requester",
   "marker": "<!--admin-validation-->"
 }"""
@@ -77,9 +94,9 @@ Format: Return ONLY valid JSON:
             if field_name:
                 logger.info(f"✅ Extracted field name: '{field_name}'")
                 logger.info(f"📋 Field type: {field_details.get('field_type', 'unknown')}")
-                logger.info(f"🎚️  Options: {field_details.get('field_options', [])}")
+                logger.info(f"🎯 Options: {field_details.get('field_options', [])}")
             else:
-                logger.warning("❌ Could not extract field name from request")
+                logger.warning("⚠️ Could not extract field name from request")
             
             # Step 2: Check for duplicates if we have API access
             duplicate_check_results = ""
@@ -93,7 +110,7 @@ Format: Return ONLY valid JSON:
                 duplicate_check_results = "⚠️ Cannot check for duplicates - no API access or field name not detected\n\n"
                 logger.warning("⚠️ Skipping duplicate check - no API access or field name")
             
-            # Step 3: Get AI validation
+            # Step 3: Get AI validation with practical approach
             validation_context = self._build_validation_context(
                 summary, description, field_details, duplicate_check_results
             )
@@ -107,6 +124,7 @@ Format: Return ONLY valid JSON:
             logger.info(f"✅ AI validation complete!")
             logger.info(f"📊 Status: {ai_result.get('status', 'unknown')}")
             logger.info(f"🔧 Auto-create: {ai_result.get('auto_create', False)}")
+            logger.info(f"💭 Reasoning: {ai_result.get('reasoning', 'N/A')}")
             
             # Step 4: Auto-create field if approved
             field_creation_result = None
@@ -132,7 +150,7 @@ Format: Return ONLY valid JSON:
             # Step 5: Post comment to Jira
             comment_posted = False
             if self.jira and ai_result.get("comment"):
-                comment_text = self._build_comment(ai_result, field_creation_result, duplicate_check)
+                comment_text = self._build_practical_comment(ai_result, field_creation_result, duplicate_check)
                 comment_result = self.jira.add_comment(issue_key, comment_text)
                 
                 if "error" not in comment_result:
@@ -195,10 +213,10 @@ Format: Return ONLY valid JSON:
         logger.info(f"🎯 Found {len(duplicates)} exact duplicates")
         logger.info(f"🔍 Found {len(similar)} similar fields")
         
-        result = f"""REAL DUPLICATE CHECK RESULTS - THIS IS ACTUAL DATA FROM YOUR JIRA INSTANCE:
-✅ Checked {total_checked} existing custom fields in Jira
-🎯 Exact duplicates found: {len(duplicates)}
-🔍 Similar fields found: {len(similar)}
+        result = f"""DUPLICATE CHECK RESULTS:
+✅ Scanned {total_checked} existing custom fields
+🎯 Exact duplicates: {len(duplicates)}
+🔍 Similar fields: {len(similar)}
 
 """
         
@@ -215,34 +233,36 @@ Format: Return ONLY valid JSON:
             result += "\n"
         
         if not duplicates and not similar:
-            result += "✅ CONFIRMED: No duplicates or similar fields found - field name appears unique!\n"
-            result += "✅ Safe to proceed with field creation.\n\n"
+            result += "✅ No duplicates found - field name is unique\n\n"
         
         return result
     
     def _build_validation_context(self, summary: str, description: str, 
                                 field_details: Dict, duplicate_results: str) -> str:
         """Build context for AI validation"""
-        return f"""ADMIN REQUEST ANALYSIS:
-Request Summary: {summary}
-Request Description: {description}
+        return f"""ADMIN REQUEST VALIDATION:
 
-EXTRACTED FIELD DETAILS:
+REQUEST DETAILS:
+Summary: {summary}
+Description: {description or 'No additional description provided'}
+
+EXTRACTED FIELD INFO:
 Field Name: {field_details.get('field_name', 'Could not extract')}
-Field Type: {field_details.get('field_type', 'unknown')}
+Field Type: {field_details.get('field_type', 'text')}
 Field Options: {field_details.get('field_options', [])}
 
 {duplicate_results}
 
-CRITICAL INSTRUCTIONS:
-- Use ONLY the real duplicate check results above
-- Do NOT assume or guess about duplicates
-- If the duplicate check shows "No duplicates found", then there are NO duplicates
-- Only flag duplicate issues if actual duplicates were found in the real data above
-- If no real duplicates found and request has sufficient detail, APPROVE it
+VALIDATION TASK:
+Evaluate this admin request using practical judgment. Focus on preventing real problems, not enforcing bureaucracy.
 
-TASK: Validate this admin request using ONLY the real duplicate check results above. 
-If APPROVED and you have all needed info, set auto_create=true to create the field automatically.
+- Simple text field requests should generally be approved
+- Missing descriptions are fine - generate reasonable ones  
+- Only flag for review if genuinely unclear or problematic
+- Only reject if there are actual conflicts or violations
+- Remember: admins prefer efficiency over excessive validation
+
+Be helpful and pragmatic, not rigid.
 """
     
     def _auto_create_field(self, ai_result: Dict) -> Optional[Dict]:
@@ -251,61 +271,57 @@ If APPROVED and you have all needed info, set auto_create=true to create the fie
             return self.jira.create_custom_field(
                 field_name=ai_result["field_name"],
                 field_type=ai_result.get("field_type", "text"),
-                description=ai_result.get("field_description", f"Auto-created: {ai_result['field_name']}"),
+                description=ai_result.get("field_description", f"Custom field: {ai_result['field_name']}"),
                 options=ai_result.get("field_options", []),
             )
         except Exception as e:
             logger.error(f"❌ Field creation error: {e}")
             return {"error": str(e)}
     
-    def _build_comment(self, ai_result: Dict, field_creation_result: Optional[Dict], 
-                      duplicate_check: Dict) -> str:
-        """Build comprehensive comment for Jira ticket"""
+    def _build_practical_comment(self, ai_result: Dict, field_creation_result: Optional[Dict], 
+                                duplicate_check: Dict) -> str:
+        """Build practical, workflow-aware comment"""
         status_emoji = {
             "approved": "✅",
-            "needs_info": "⚠️",
+            "needs_info": "⚠️", 
             "rejected": "❌"
         }.get(ai_result.get("status", ""), "❓")
         
         comment_text = f"{ai_result.get('marker', '<!--admin-validation-->')}\n\n"
         comment_text += f"**🤖 AI Admin Validation {status_emoji}**\n\n"
-        comment_text += f"**Status:** {ai_result.get('status', 'unknown').title()}\n\n"
+        comment_text += f"**Status:** {ai_result.get('status', 'unknown').replace('_', ' ').title()}\n\n"
         
-        # Add duplicate check summary
+        # Add duplicate check summary if available
         if duplicate_check and "error" not in duplicate_check:
             total_checked = duplicate_check.get("total_checked", 0)
             duplicates_count = len(duplicate_check.get("duplicates", []))
             similar_count = len(duplicate_check.get("similar", []))
-            comment_text += f"**Duplicate Check:** Scanned {total_checked} existing fields - "
-            comment_text += f"{duplicates_count} exact, {similar_count} similar matches\n\n"
+            comment_text += f"**Duplicate Check:** Scanned {total_checked} existing fields - {duplicates_count} exact, {similar_count} similar\n\n"
         
-        # Add field creation result
+        # Field creation result
         if field_creation_result:
             if "error" not in field_creation_result:
                 field_id = field_creation_result["field"]["id"]
-                comment_text += f"**✅ FIELD CREATED AUTOMATICALLY!**\n"
+                comment_text += f"**✅ FIELD CREATED SUCCESSFULLY**\n"
                 comment_text += f"Field ID: `{field_id}`\n"
-                comment_text += f"Field Name: {ai_result.get('field_name')}\n"
-                comment_text += f"Field Type: {ai_result.get('field_type', 'text')}\n"
+                comment_text += f"Name: {ai_result.get('field_name')}\n"
+                comment_text += f"Type: {ai_result.get('field_type', 'text').title()}\n"
                 if ai_result.get('field_options'):
                     comment_text += f"Options: {', '.join(ai_result['field_options'])}\n"
-                comment_text += f"\n"
+                comment_text += "\nField is now available for use in your project.\n\n"
             else:
-                comment_text += f"**❌ Auto-creation attempted but failed:**\n{field_creation_result['error']}\n\n"
+                comment_text += f"**❌ Auto-creation failed:** {field_creation_result['error']}\n\n"
         
-        # Add AI comment
-        comment_text += ai_result['comment']
+        # Main response
+        comment_text += ai_result.get('comment', 'Request processed by AI admin assistant.')
         
-        # Add issues and suggestions
-        if ai_result.get("issues"):
-            comment_text += f"\n\n**Issues Found:**\n"
-            for issue in ai_result["issues"]:
-                comment_text += f"• {issue}\n"
+        # Add reasoning if provided
+        if ai_result.get("reasoning"):
+            comment_text += f"\n\n**Reasoning:** {ai_result['reasoning']}"
         
-        if ai_result.get("suggestions"):
-            comment_text += f"\n**Suggestions:**\n"
-            for suggestion in ai_result["suggestions"]:
-                comment_text += f"• {suggestion}\n"
+        # Add workflow guidance if provided
+        if ai_result.get("workflow_note"):
+            comment_text += f"\n\n**Next Steps:** {ai_result['workflow_note']}"
         
         return comment_text
     

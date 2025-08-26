@@ -165,7 +165,7 @@ def process_webhook(webhook_data: Dict) -> Dict:
     issue_data = build_issue_from_webhook(webhook_data)
     
     # If we don't have summary and we have API access, fetch from Jira
-    if not issue_data.get("fields", {}).get("summary") and config.jira_token:
+    if not issue_data.get("fields", {}).get("summary") and (config.jira_api_token or config.jira_bearer_token):
         logger.info("⚠️  No summary in webhook data, fetching from API...")
         try:
             jira = JiraAPI(config)
@@ -307,12 +307,28 @@ async def jira_hook(request: Request):
         "timestamp": datetime.now().isoformat()
     }
 
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "service": "Jira AI Agent", 
+        "version": "2.0.0",
+        "status": "running",
+        "endpoints": {
+            "webhook": "/jira-hook",
+            "health": "/health", 
+            "debug_config": "/debug/config",
+            "debug_extraction": "/debug/extraction",
+            "test_ollama": "/test/ollama"
+        }
+    }
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
     # Test Jira connection if configured
     jira_status = "not_configured"
-    if config.jira_token:
+    if config.jira_api_token or config.jira_bearer_token:
         try:
             jira = JiraAPI(config)
             conn_test = jira.test_connection()
@@ -337,7 +353,7 @@ async def debug_config():
         raise HTTPException(status_code=404, detail="Not found")
     
     return {
-        "jira_configured": bool(config.jira_token),
+        "jira_configured": bool(config.jira_api_token or config.jira_bearer_token),
         "jira_base_url": config.jira_base_url,
         "model": config.model,
         "ollama_url": config.ollama_url,

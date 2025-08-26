@@ -55,7 +55,7 @@ def main():
         uvicorn.run(
             "main:app",
             host="127.0.0.1",
-            port=8000,
+            port=8001,
             reload=not config.production,
             access_log=not config.production,
             log_level="info" if not config.production else "warning",
