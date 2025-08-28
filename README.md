@@ -111,6 +111,9 @@ python run.py
 uvicorn main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
+#Start the cloudflare tunnel
+cloudflare-tunnel --url http://localhost:8001
+
 ## 🔧 API Endpoints
 
 ### Main Webhook

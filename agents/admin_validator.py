@@ -1,338 +1,335 @@
 """
-Admin Validator Agent - Updated with more practical validation approach
+Generic Jira API Executor - Let the LLM call any API it knows about
 """
 
 from typing import Dict, List, Optional, Any
 import json
+import requests
+import copy
 from datetime import datetime
 
 from config import Config
-from jira.api import JiraAPI
-from jira.field_extractor import extract_field_details
 from ai.ollama_client import call_ollama
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-class AdminValidator:
-    """AI agent that validates admin requests with practical, workflow-aware approach"""
+class GenericJiraAPI:
+    """Generic Jira API that can execute any REST call the LLM requests"""
+    
+    def __init__(self, config: Config):
+        self.base_url = config.jira_base_url.rstrip("/")
+        self.session = requests.Session()
+        
+        if config.jira_email and config.jira_api_token:
+            import base64
+            credentials = base64.b64encode(f"{config.jira_email}:{config.jira_api_token}".encode()).decode()
+            self.session.headers.update({
+                "Authorization": f"Basic {credentials}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            })
+        elif config.jira_bearer_token:
+            self.session.headers.update({
+                "Authorization": f"Bearer {config.jira_bearer_token}",
+                "Accept": "application/json", 
+                "Content-Type": "application/json",
+            })
+    
+    def execute_api_call(self, method: str, endpoint: str, payload: Dict = None, params: Dict = None) -> Dict:
+        """Execute arbitrary Jira REST API calls"""
+        try:
+            # Construct full URL
+            if endpoint.startswith('http'):
+                url = endpoint
+            else:
+                url = f"{self.base_url}{endpoint}"
+            
+            logger.info(f"API Call: {method} {endpoint}")
+            if payload:
+                logger.debug(f"Payload: {json.dumps(payload, indent=2)}")
+            
+            # Make the API call
+            response = self.session.request(
+                method=method.upper(),
+                url=url,
+                json=payload if payload else None,
+                params=params if params else None
+            )
+            
+            logger.info(f"Response: {response.status_code}")
+            
+            # Return structured response
+            try:
+                response_data = response.json() if response.text else {}
+            except:
+                response_data = {"raw_response": response.text}
+            
+            return {
+                "success": response.status_code < 400,
+                "status_code": response.status_code,
+                "data": response_data,
+                "headers": dict(response.headers)
+            }
+            
+        except Exception as e:
+            logger.error(f"API call failed: {e}")
+            return {
+                "success": False,
+                "error": str(e)
+            }
+
+class UnrestrictedJiraAgent:
+    """AI agent with unrestricted access to Jira APIs"""
     
     def __init__(self, config: Config):
         self.config = config
-
-        # Cloud Basic OR Server/DC Bearer
-        has_jira_creds = bool(
-            (config.jira_email and config.jira_api_token) or config.jira_bearer_token
-        )
-        self.jira = JiraAPI(config) if has_jira_creds else None
+        self.jira = GenericJiraAPI(config)
         
-        # Updated system prompt - more practical and less rigid
-        self.system_prompt = """You are a practical Jira admin who validates field requests efficiently and reasonably.
+        # System prompt with concrete API examples to prevent reasoning loops
+        self.system_prompt = """You are a Jira administrator with access to tested API endpoints. Use ONLY these endpoints:
 
-INPUT: Field creation request with duplicate check results and extracted details
-OUTPUT: Validation decision with optional auto-creation
+CUSTOM FIELDS:
+- GET /rest/api/3/field (list all fields)
+- POST /rest/api/3/field (create custom field)
+  Required: {"name": "Field Name", "type": "FIELD_TYPE", "description": "Description"}
+  Types: "com.atlassian.jira.plugin.system.customfieldtypes:select" (dropdown)
+         "com.atlassian.jira.plugin.system.customfieldtypes:textfield" (text)
+         "com.atlassian.jira.plugin.system.customfieldtypes:textarea" (paragraph)
 
-VALIDATION APPROACH - Be practical, not pedantic:
+SCREENS:
+- GET /rest/api/3/screens (list all screens)
+- GET /rest/api/3/screens/{screenId} (get screen details)
+- PUT /rest/api/3/screens/{screenId}/addToDefault/{fieldId} (add field to default screen)
 
-APPROVE AND AUTO-CREATE when:
-- Simple field requests with clear names and no exact duplicates
-- Basic text fields, even without detailed descriptions
-- Reasonable field names that follow basic conventions
-- Similar fields exist but serve different purposes
+FIELD OPTIONS (for select fields):
+- GET /rest/api/3/field/{fieldId}/contexts (get field contexts)
+- POST /rest/api/3/field/{fieldId}/context/{contextId}/option (add options)
+  Body: {"options": [{"value": "Option Name"}]}
 
-FLAG FOR REVIEW (needs_info) only when:
-- Select fields requested without any options specified
-- Field names are vague/unclear (like "Field1" or "Test")
-- Potential security/compliance concerns
-- Complex custom field types that need clarification
+WORKFLOWS:
+- GET /rest/api/3/workflow (list workflows)
 
-REJECT only when:
-- Exact duplicate field already exists with same purpose
-- Field name violates clear naming standards
-- Request is genuinely inappropriate or nonsensical
+PROJECTS:  
+- GET /rest/api/3/project (list projects)
 
-PRACTICAL RULES:
-- Missing descriptions are fine - generate reasonable ones
-- Don't require extensive documentation for simple requests
-- Trust the requester's judgment on field necessity
-- Focus on preventing actual problems, not enforcing bureaucracy
-- Auto-approve 80% of reasonable requests
-- Keep humans in the loop for genuinely complex cases
+When you receive a request:
+1. Understand what needs to be done
+2. Plan the API calls in order
+3. Use context variables {{step_N_id}} for values from previous steps
 
-Format: Return ONLY valid JSON:
+Return this EXACT JSON structure:
 {
-  "status": "approved|needs_info|rejected",
-  "auto_create": true|false,
-  "field_name": "Cleaned field name",
-  "field_type": "select|text|textarea|number|date|multiselect",
-  "field_description": "Professional but concise description (auto-generate if missing)",
-  "field_options": ["Option1", "Option2"] or [],
-  "reasoning": "Brief explanation of decision",
-  "workflow_note": "Any guidance for admin workflow",
-  "comment": "Professional explanation for the requester",
-  "marker": "<!--admin-validation-->"
-}"""
-    
+  "understanding": "Clear description of what you understood",
+  "plan": [
+    {
+      "step": 1,
+      "description": "What this step accomplishes",
+      "api_call": {
+        "method": "POST",
+        "endpoint": "/rest/api/3/field",
+        "payload": {"name": "Priority Level", "type": "com.atlassian.jira.plugin.system.customfieldtypes:select", "description": "Priority classification"}
+      }
+    },
+    {
+      "step": 2,
+      "description": "Add options to the select field",
+      "api_call": {
+        "method": "GET",
+        "endpoint": "/rest/api/3/field/{{step_1_id}}/contexts"
+      }
+    }
+  ],
+  "safety_checks": ["Any warnings or confirmations needed"],
+  "expected_outcome": "What will be accomplished"
+}
+
+Focus on business logic. Don't question the API endpoints - they work. Keep plans under 5 steps when possible."""
+
     def process(self, issue_data: Dict) -> Dict:
-        """Main processing method for admin validation requests"""
+        """Process any admin request with full API access"""
         issue_key = issue_data["key"]
-        fields = issue_data["fields"]
+        fields = issue_data.get("fields") or {}
         
-        logger.info(f"🛡️  Processing admin validation for issue: {issue_key}")
-        
-        # Extract basic info
-        summary = fields.get("summary", "")
+        summary = fields.get("summary") or ""
         description = self._extract_description_text(fields.get("description"))
+        full_request = f"{summary}\n\n{description}".strip()
         
-        logger.info(f"📝 Request: {summary}")
+        logger.info(f"Processing unrestricted request: {issue_key}")
+        logger.info(f"Request: {full_request[:200]}...")
         
         try:
-            # Step 1: Extract field details from the request
-            field_details = extract_field_details(summary, description)
-            field_name = field_details.get("field_name", "")
+            # Get the AI's execution plan
+            ai_response = call_ollama(full_request, self.system_prompt, self.config)
             
-            if field_name:
-                logger.info(f"✅ Extracted field name: '{field_name}'")
-                logger.info(f"📋 Field type: {field_details.get('field_type', 'unknown')}")
-                logger.info(f"🎯 Options: {field_details.get('field_options', [])}")
-            else:
-                logger.warning("⚠️ Could not extract field name from request")
+            if not isinstance(ai_response, dict) or "plan" not in ai_response:
+                logger.error("AI failed to create valid execution plan")
+                return {"error": "AI failed to create execution plan", "raw_response": ai_response}
             
-            # Step 2: Check for duplicates if we have API access
-            duplicate_check_results = ""
-            duplicate_check = {}
+            logger.info(f"AI Understanding: {ai_response.get('understanding')}")
+            logger.info(f"Plan has {len(ai_response.get('plan', []))} steps")
             
-            if self.jira and field_name:
-                logger.info(f"🔍 Checking for duplicate field: '{field_name}'")
-                duplicate_check = self.jira.check_duplicate_field(field_name)
-                duplicate_check_results = self._format_duplicate_results(duplicate_check)
-            else:
-                duplicate_check_results = "⚠️ Cannot check for duplicates - no API access or field name not detected\n\n"
-                logger.warning("⚠️ Skipping duplicate check - no API access or field name")
+            # Check for safety concerns
+            safety_checks = ai_response.get("safety_checks", [])
+            if safety_checks:
+                logger.warning(f"Safety checks needed: {safety_checks}")
+                # Block DELETE operations without confirmation
+                for step in ai_response.get("plan", []):
+                    if step.get("api_call", {}).get("method") == "DELETE":
+                        return {
+                            "status": "blocked",
+                            "reason": "DELETE operation requires explicit confirmation",
+                            "safety_checks": safety_checks,
+                            "plan": ai_response.get("plan")
+                        }
             
-            # Step 3: Get AI validation with practical approach
-            validation_context = self._build_validation_context(
-                summary, description, field_details, duplicate_check_results
-            )
+            # Execute the plan
+            execution_results = []
+            context = {}  # Store values between steps (like field IDs)
             
-            ai_result = call_ollama(validation_context, self.system_prompt, self.config)
-            
-            if "error" in ai_result:
-                logger.error(f"❌ AI validation failed: {ai_result['error']}")
-                return self._create_error_response(issue_key, ai_result["error"])
-            
-            logger.info(f"✅ AI validation complete!")
-            logger.info(f"📊 Status: {ai_result.get('status', 'unknown')}")
-            logger.info(f"🔧 Auto-create: {ai_result.get('auto_create', False)}")
-            logger.info(f"💭 Reasoning: {ai_result.get('reasoning', 'N/A')}")
-            
-            # Step 4: Auto-create field if approved
-            field_creation_result = None
-            if (
-                self.jira and 
-                ai_result.get("status") == "approved" and 
-                ai_result.get("auto_create") and
-                ai_result.get("field_name")
-            ):
-                logger.info("🚀 Auto-creating field as requested by AI...")
-                field_creation_result = self._auto_create_field(ai_result)
+            for step in ai_response.get("plan", []):
+                step_num = step.get("step", len(execution_results) + 1)
+                logger.info(f"Executing step {step_num}: {step.get('description')}")
                 
-                if field_creation_result and "error" not in field_creation_result:
-                    logger.info("🎉 Field successfully auto-created!")
-                    ai_result["field_created"] = True
-                    ai_result["field_id"] = field_creation_result["field"]["id"]
-                else:
-                    error_msg = field_creation_result.get("error", "Unknown error") if field_creation_result else "Creation failed"
-                    logger.error(f"❌ Auto-creation failed: {error_msg}")
-                    ai_result["field_created"] = False
-                    ai_result["creation_error"] = error_msg
-            
-            # Step 5: Post comment to Jira
-            comment_posted = False
-            if self.jira and ai_result.get("comment"):
-                comment_text = self._build_practical_comment(ai_result, field_creation_result, duplicate_check)
-                comment_result = self.jira.add_comment(issue_key, comment_text)
+                api_call = step.get("api_call", {})
                 
-                if "error" not in comment_result:
-                    logger.info("✅ Successfully posted admin validation comment!")
-                    comment_posted = True
-                else:
-                    logger.error(f"❌ Failed to post comment: {comment_result['error']}")
+                # Replace any context variables in the API call
+                api_call = self._substitute_context_variables(api_call, context)
+                
+                # Execute the API call
+                result = self.jira.execute_api_call(
+                    method=api_call.get("method", "GET"),
+                    endpoint=api_call.get("endpoint", ""),
+                    payload=api_call.get("payload"),
+                    params=api_call.get("params")
+                )
+                
+                # Store important values in context for next steps
+                if result.get("success"):
+                    data = result.get("data", {})
+                    if "id" in data:
+                        context[f"step_{step_num}_id"] = data["id"]
+                    if "key" in data:
+                        context[f"step_{step_num}_key"] = data["key"]
+                    # Store the whole result for complex references
+                    context[f"step_{step_num}_result"] = data
+                    
+                    logger.info(f"Step {step_num} successful, stored context: {list(context.keys())}")
+                
+                execution_results.append({
+                    "step": step_num,
+                    "description": step.get("description"),
+                    "success": result.get("success", False),
+                    "result": result
+                })
+                
+                # Stop on first failure
+                if not result.get("success"):
+                    logger.error(f"Step {step_num} failed: {result.get('error')}")
+                    break
             
-            # Return comprehensive result
+            # Post results comment
+            self._post_results_comment(issue_key, ai_response, execution_results)
+            
             return {
                 "received": True,
-                "action": "admin_validation",
                 "issueKey": issue_key,
-                "mode_detected": "admin_validator",
-                "validation_status": ai_result.get("status"),
-                "field_name": field_name,
-                "field_created": ai_result.get("field_created", False),
-                "field_id": ai_result.get("field_id"),
-                "comment_posted": comment_posted,
-                "duplicates_found": len(duplicate_check.get("duplicates", [])) if duplicate_check else "unknown",
-                "ai_response": ai_result,
-                "creation_result": field_creation_result,
+                "ai_understanding": ai_response.get("understanding"),
+                "plan": ai_response.get("plan"),
+                "execution_results": execution_results,
+                "steps_completed": len([r for r in execution_results if r.get("success")]),
+                "total_steps": len(ai_response.get("plan", [])),
+                "expected_outcome": ai_response.get("expected_outcome"),
                 "timestamp": datetime.now().isoformat()
             }
             
         except Exception as e:
-            logger.error(f"❌ Error processing admin validation: {e}")
-            return self._create_error_response(issue_key, str(e))
+            logger.error(f"Error in unrestricted processing: {e}")
+            return {"error": str(e), "issueKey": issue_key}
+    
+    def _substitute_context_variables(self, api_call: Dict, context: Dict) -> Dict:
+        """Replace context variables like {{step_1_id}} with actual values"""
+        if not context:
+            return api_call
+            
+        result = copy.deepcopy(api_call)
+        
+        def replace_in_value(value):
+            if isinstance(value, str) and "{{" in value and "}}" in value:
+                for key, ctx_value in context.items():
+                    placeholder = "{{" + key + "}}"
+                    if placeholder in value:
+                        # Replace the entire string if it's just the placeholder
+                        if value.strip() == placeholder:
+                            return ctx_value
+                        else:
+                            value = value.replace(placeholder, str(ctx_value))
+                return value
+            elif isinstance(value, dict):
+                return {k: replace_in_value(v) for k, v in value.items()}
+            elif isinstance(value, list):
+                return [replace_in_value(item) for item in value]
+            return value
+        
+        return replace_in_value(result)
     
     def _extract_description_text(self, description_obj: Any) -> str:
-        """Extract plain text from Jira description object"""
+        """Extract plain text from Jira description"""
         if not description_obj:
             return ""
-        
         if isinstance(description_obj, str):
             return description_obj
-        
         if isinstance(description_obj, dict):
-            text = ""
-            content = description_obj.get("content", [])
-            for block in content:
+            text = []
+            for block in (description_obj.get("content") or []):
                 if block.get("type") == "paragraph":
-                    for item in block.get("content", []):
+                    for item in (block.get("content") or []):
                         if item.get("type") == "text":
-                            text += item.get("text", "")
-            return text
-        
+                            text.append(item.get("text", ""))
+            return "".join(text)
         return str(description_obj)
     
-    def _format_duplicate_results(self, duplicate_check: Dict) -> str:
-        """Format duplicate check results for AI prompt"""
-        if "error" in duplicate_check:
-            return f"⚠️ Could not check for duplicates: {duplicate_check['error']}\n\n"
-        
-        duplicates = duplicate_check.get("duplicates", [])
-        similar = duplicate_check.get("similar", [])
-        total_checked = duplicate_check.get("total_checked", 0)
-        
-        logger.info(f"📊 Checked {total_checked} custom fields")
-        logger.info(f"🎯 Found {len(duplicates)} exact duplicates")
-        logger.info(f"🔍 Found {len(similar)} similar fields")
-        
-        result = f"""DUPLICATE CHECK RESULTS:
-✅ Scanned {total_checked} existing custom fields
-🎯 Exact duplicates: {len(duplicates)}
-🔍 Similar fields: {len(similar)}
-
-"""
-        
-        if duplicates:
-            result += "EXACT DUPLICATES FOUND:\n"
-            for dup in duplicates:
-                result += f"• '{dup['name']}' (ID: {dup['id']})\n"
-            result += "\n"
-        
-        if similar:
-            result += "SIMILAR FIELDS FOUND:\n"
-            for sim in similar:
-                result += f"• '{sim['name']}' (ID: {sim['id']})\n"
-            result += "\n"
-        
-        if not duplicates and not similar:
-            result += "✅ No duplicates found - field name is unique\n\n"
-        
-        return result
-    
-    def _build_validation_context(self, summary: str, description: str, 
-                                field_details: Dict, duplicate_results: str) -> str:
-        """Build context for AI validation"""
-        return f"""ADMIN REQUEST VALIDATION:
-
-REQUEST DETAILS:
-Summary: {summary}
-Description: {description or 'No additional description provided'}
-
-EXTRACTED FIELD INFO:
-Field Name: {field_details.get('field_name', 'Could not extract')}
-Field Type: {field_details.get('field_type', 'text')}
-Field Options: {field_details.get('field_options', [])}
-
-{duplicate_results}
-
-VALIDATION TASK:
-Evaluate this admin request using practical judgment. Focus on preventing real problems, not enforcing bureaucracy.
-
-- Simple text field requests should generally be approved
-- Missing descriptions are fine - generate reasonable ones  
-- Only flag for review if genuinely unclear or problematic
-- Only reject if there are actual conflicts or violations
-- Remember: admins prefer efficiency over excessive validation
-
-Be helpful and pragmatic, not rigid.
-"""
-    
-    def _auto_create_field(self, ai_result: Dict) -> Optional[Dict]:
-        """Auto-create the custom field based on AI validation"""
+    def _post_results_comment(self, issue_key: str, ai_response: Dict, execution_results: List[Dict]):
+        """Post a comment showing what was accomplished"""
         try:
-            return self.jira.create_custom_field(
-                field_name=ai_result["field_name"],
-                field_type=ai_result.get("field_type", "text"),
-                description=ai_result.get("field_description", f"Custom field: {ai_result['field_name']}"),
-                options=ai_result.get("field_options", []),
+            successful_steps = len([r for r in execution_results if r.get("success")])
+            total_steps = len(execution_results)
+            
+            comment = f"Admin request completed: {successful_steps}/{total_steps} steps successful\n\n"
+            comment += f"**Understanding:** {ai_response.get('understanding', 'N/A')}\n\n"
+            
+            for result in execution_results:
+                step_num = result.get("step")
+                desc = result.get("description")
+                success = result.get("success", False)
+                
+                status = "✅" if success else "❌"
+                comment += f"{status} Step {step_num}: {desc}\n"
+                
+                if not success:
+                    error = result.get("result", {}).get("error", "Unknown error")
+                    comment += f"   Error: {error}\n"
+            
+            if ai_response.get("expected_outcome"):
+                comment += f"\n**Expected Result:** {ai_response['expected_outcome']}"
+            
+            # Post the comment
+            self.jira.execute_api_call(
+                method="POST",
+                endpoint=f"/rest/api/3/issue/{issue_key}/comment",
+                payload={
+                    "body": {
+                        "type": "doc",
+                        "version": 1,
+                        "content": [
+                            {
+                                "type": "paragraph",
+                                "content": [{"type": "text", "text": comment}]
+                            }
+                        ]
+                    }
+                }
             )
+            
         except Exception as e:
-            logger.error(f"❌ Field creation error: {e}")
-            return {"error": str(e)}
-    
-    def _build_practical_comment(self, ai_result: Dict, field_creation_result: Optional[Dict], 
-                                duplicate_check: Dict) -> str:
-        """Build practical, workflow-aware comment"""
-        status_emoji = {
-            "approved": "✅",
-            "needs_info": "⚠️", 
-            "rejected": "❌"
-        }.get(ai_result.get("status", ""), "❓")
-        
-        comment_text = f"{ai_result.get('marker', '<!--admin-validation-->')}\n\n"
-        comment_text += f"**🤖 AI Admin Validation {status_emoji}**\n\n"
-        comment_text += f"**Status:** {ai_result.get('status', 'unknown').replace('_', ' ').title()}\n\n"
-        
-        # Add duplicate check summary if available
-        if duplicate_check and "error" not in duplicate_check:
-            total_checked = duplicate_check.get("total_checked", 0)
-            duplicates_count = len(duplicate_check.get("duplicates", []))
-            similar_count = len(duplicate_check.get("similar", []))
-            comment_text += f"**Duplicate Check:** Scanned {total_checked} existing fields - {duplicates_count} exact, {similar_count} similar\n\n"
-        
-        # Field creation result
-        if field_creation_result:
-            if "error" not in field_creation_result:
-                field_id = field_creation_result["field"]["id"]
-                comment_text += f"**✅ FIELD CREATED SUCCESSFULLY**\n"
-                comment_text += f"Field ID: `{field_id}`\n"
-                comment_text += f"Name: {ai_result.get('field_name')}\n"
-                comment_text += f"Type: {ai_result.get('field_type', 'text').title()}\n"
-                if ai_result.get('field_options'):
-                    comment_text += f"Options: {', '.join(ai_result['field_options'])}\n"
-                comment_text += "\nField is now available for use in your project.\n\n"
-            else:
-                comment_text += f"**❌ Auto-creation failed:** {field_creation_result['error']}\n\n"
-        
-        # Main response
-        comment_text += ai_result.get('comment', 'Request processed by AI admin assistant.')
-        
-        # Add reasoning if provided
-        if ai_result.get("reasoning"):
-            comment_text += f"\n\n**Reasoning:** {ai_result['reasoning']}"
-        
-        # Add workflow guidance if provided
-        if ai_result.get("workflow_note"):
-            comment_text += f"\n\n**Next Steps:** {ai_result['workflow_note']}"
-        
-        return comment_text
-    
-    def _create_error_response(self, issue_key: str, error: str) -> Dict:
-        """Create standardized error response"""
-        return {
-            "received": True,
-            "action": "admin_validation",
-            "issueKey": issue_key,
-            "mode_detected": "admin_validator",
-            "error": error,
-            "validation_status": "error",
-            "timestamp": datetime.now().isoformat()
-        }
+            logger.error(f"Failed to post results comment: {e}")

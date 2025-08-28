@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Jira AI Agent - Main Entry Point
-Professional modular architecture with webhook processing
+Now using unified agent that can perform any Jira operation
 """
 
 from fastapi import FastAPI, Request, HTTPException
@@ -11,12 +11,10 @@ import threading
 import time
 import hmac
 from datetime import datetime
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 from config import get_config
-from agents.admin_validator import AdminValidator
-from agents.pm_enhancer import PMEnhancer
-from agents.governance_bot import GovernanceBot
+from agents.unified_agent import UnifiedJiraAgent
 from jira.api import JiraAPI
 from utils.logger import setup_logger
 
@@ -27,8 +25,8 @@ logger = setup_logger(__name__)
 # FastAPI app
 app = FastAPI(
     title="Jira AI Agent",
-    description="AI-powered Jira automation and enhancement",
-    version="2.0.0",
+    description="Autonomous AI-powered Jira agent with full API access",
+    version="3.0.0",
     docs_url=None if config.production else "/docs",
     redoc_url=None if config.production else "/redoc"
 )
@@ -36,10 +34,16 @@ app = FastAPI(
 # Background job queue
 jobs = queue.Queue()
 
-# Initialize agents
-admin_validator = AdminValidator(config)
-pm_enhancer = PMEnhancer(config) 
-governance_bot = GovernanceBot(config)
+# Initialize unified agent with error handling
+try:
+    logger.info("Creating UnifiedJiraAgent...")
+    unified_agent = UnifiedJiraAgent(config)
+    logger.info(f"UnifiedJiraAgent created successfully with {len(unified_agent.available_tools)} tools")
+except Exception as e:
+    logger.error(f"Failed to create UnifiedJiraAgent: {e}")
+    import traceback
+    logger.error(f"Traceback: {traceback.format_exc()}")
+    unified_agent = None
 
 class WebhookPayload(BaseModel):
     """Webhook payload structure"""
@@ -52,76 +56,26 @@ class WebhookPayload(BaseModel):
     issueType: Optional[str] = None
     raw_data: Optional[Dict[str, Any]] = None
 
-# ========================= AUTO-DETECTION =========================
-
-def detect_ai_mode(issue_data: Dict) -> str:
-    """Auto-detect which AI agent should handle this request"""
-    fields = issue_data.get("fields", {})
-    summary = (fields.get("summary") or "").lower()
-    
-    # Extract description text
-    description = ""
-    desc_obj = fields.get("description")
-    if desc_obj and isinstance(desc_obj, dict):
-        content = desc_obj.get("content", [])
-        for block in content:
-            if block.get("type") == "paragraph":
-                for item in block.get("content", []):
-                    if item.get("type") == "text":
-                        description += item.get("text", "")
-    description = description.lower()
-    
-    # Admin request detection
-    admin_keywords = [
-        "custom field", "field", "workflow", "permission", "scheme", 
-        "configuration", "admin", "create field", "add field", "new field", 
-        "screen", "role", "user management", "project settings"
-    ]
-    
-    if any(keyword in summary + " " + description for keyword in admin_keywords):
-        return "admin_validator"
-    
-    # Meeting notes / enhancement detection
-    enhancement_keywords = [
-        "meeting notes", "transcript", "brain dump", "requirements gathering",
-        "unclear", "needs improvement", "enhance", "rewrite"
-    ]
-    
-    if any(keyword in summary + " " + description for keyword in enhancement_keywords):
-        return "pm_enhancer"
-    
-    # Governance issues (stale, missing fields, etc.)
-    governance_keywords = [
-        "stale", "cleanup", "governance", "missing", "violation", 
-        "standard", "convention", "policy"
-    ]
-    
-    if any(keyword in summary + " " + description for keyword in governance_keywords):
-        return "governance_bot"
-    
-    # Default based on content length and complexity
-    if len(description) > 500 or "acceptance criteria" in description:
-        return "pm_enhancer"
-    
-    return "pm_enhancer"  # Safe default
-
 def build_issue_from_webhook(webhook_data: Dict) -> Dict:
     """Build proper issue structure from webhook data"""
+    
+    logger.info(f"build_issue_from_webhook received: {webhook_data}")
+    logger.info(f"webhook_data keys: {list(webhook_data.keys()) if webhook_data else 'None'}")
+    
     issue_key = webhook_data.get("issueKey")
+    logger.info(f"Extracted issue_key: {issue_key}")
     
-    # If we already have full issue data, use it
-    if webhook_data.get("issue") and webhook_data["issue"].get("fields"):
-        return webhook_data["issue"]
+    if not issue_key:
+        logger.error("No issue key found, returning None")
+        return None
     
-    # Build minimal issue structure
+    # Build issue structure from flat webhook data
     issue_data = {
         "key": issue_key,
         "fields": {
             "summary": webhook_data.get("summary", ""),
             "issuetype": {"name": webhook_data.get("issueType", "Task")},
-            "project": {
-                "key": issue_key.split("-")[0] if issue_key and "-" in issue_key else "UNKNOWN"
-            },
+            "project": {"key": issue_key.split("-")[0] if issue_key and "-" in issue_key else "UNKNOWN"},
             "assignee": None,
             "labels": [],
             "status": {"name": "To Do"}
@@ -147,77 +101,47 @@ def build_issue_from_webhook(webhook_data: Dict) -> Dict:
             ]
         }
     
+    # ADD THIS DEBUG LOG
+    logger.info(f"Built issue_data: {issue_data}")
+    logger.info(f"Returning issue_data with key: {issue_data.get('key')}")
+    
     return issue_data
 
-# ========================= PROCESSING =========================
-
 def process_webhook(webhook_data: Dict) -> Dict:
-    """Main webhook processing logic"""
+    """Process webhook using unified agent"""
     issue_key = webhook_data.get("issueKey") or webhook_data.get("issue", {}).get("key")
     
     if not issue_key:
         logger.error("No issue key provided in webhook")
         return {"error": "No issue key provided"}
     
-    logger.info(f"🚀 Processing webhook for issue: {issue_key}")
+    logger.info(f"Processing webhook with unified agent: {issue_key}")
     
-    # Build issue data
-    issue_data = build_issue_from_webhook(webhook_data)
-    
-    # If we don't have summary and we have API access, fetch from Jira
-    if not issue_data.get("fields", {}).get("summary") and (config.jira_api_token or config.jira_bearer_token):
-        logger.info("⚠️  No summary in webhook data, fetching from API...")
-        try:
-            jira = JiraAPI(config)
-            api_data = jira.get_issue(issue_key)
-            
-            if "error" not in api_data:
-                logger.info("✅ Successfully fetched issue data from API")
-                issue_data = api_data
-            else:
-                logger.warning(f"❌ API fetch failed: {api_data['error']}")
-        except Exception as e:
-            logger.error(f"Failed to fetch issue from API: {e}")
-    
-    # Detect which AI agent should handle this
-    ai_mode = detect_ai_mode(issue_data)
-    logger.info(f"🤖 Auto-detected mode: {ai_mode} for {issue_key}")
-    
-    # Route to appropriate agent
     try:
-        if ai_mode == "admin_validator":
-            logger.info("🛡️  Routing to Admin Validator...")
-            return admin_validator.process(issue_data)
+        # Build issue data from webhook
+        issue_data = build_issue_from_webhook(webhook_data)
         
-        elif ai_mode == "pm_enhancer":
-            logger.info("✨ Routing to PM Enhancer...")
-            return pm_enhancer.process(issue_data)
+        if not issue_data:
+            logger.error("Failed to build issue data from webhook")
+            return {"error": "Failed to build issue data", "issueKey": issue_key}
         
-        elif ai_mode == "governance_bot":
-            logger.info("🏛️  Routing to Governance Bot...")
-            return governance_bot.process(issue_data)
+        # Process with unified agent
+        logger.info("Routing to unified agent...")
+        if unified_agent is None:
+            logger.error("Unified agent not available")
+            return {"error": "Unified agent initialization failed", "issueKey": issue_key}
         
-        else:
-            logger.warning(f"Unknown AI mode: {ai_mode}")
-            return {
-                "error": f"Unknown AI mode: {ai_mode}",
-                "mode_detected": ai_mode,
-                "issueKey": issue_key
-            }
+        return unified_agent.process(issue_data)
             
     except Exception as e:
-        logger.error(f"Error processing with {ai_mode}: {e}")
-        return {
-            "error": str(e),
-            "mode_detected": ai_mode,
-            "issueKey": issue_key
-        }
+        logger.error(f"Error processing webhook: {e}")
+        return {"error": str(e), "issueKey": issue_key}
 
 # ========================= BACKGROUND WORKER =========================
 
 def worker_loop():
     """Background worker that processes jobs from the queue"""
-    logger.info("🔄 Background worker started")
+    logger.info("Background worker started")
     
     while True:
         try:
@@ -231,7 +155,9 @@ def worker_loop():
             if "error" in result:
                 logger.error(f"Job failed: {result['error']}")
             else:
-                logger.info(f"Job completed: {result.get('mode_detected', 'unknown')} mode")
+                steps = result.get('steps_completed', 0)
+                total = result.get('total_steps', 0)
+                logger.info(f"Job completed: {steps}/{total} steps successful")
             
             jobs.task_done()
             
@@ -260,23 +186,28 @@ async def jira_hook(request: Request):
     expected_secret = config.webhook_secret
     
     if not hmac.compare_digest(provided_secret, expected_secret):
-        logger.warning(f"❌ Invalid secret provided: {provided_secret[:10]}...")
+        logger.warning(f"Invalid secret provided: {provided_secret[:10]}...")
         raise HTTPException(status_code=401, detail="Invalid webhook secret")
     
-    logger.info("✅ Valid secret provided")
+    logger.info("Valid secret provided")
     
     try:
         # Parse webhook body
         body = await request.json()
         
-        # Extract issue key
+        # ADD DEBUG LOGGING HERE
+        logger.info(f"Raw webhook body: {body}")
+        
+        # Extract issue key with debugging
         issue_key = None
-        if "issue" in body and "key" in body["issue"]:
+        if "issue" in body and body["issue"] and "key" in body["issue"]:
             issue_key = body["issue"]["key"]
+            logger.info(f"Found issue key in body.issue.key: {issue_key}")
         elif "issueKey" in body:
             issue_key = body["issueKey"]
+            logger.info(f"Found issue key in body.issueKey: {issue_key}")
         
-        logger.info(f"📨 Received webhook for issue: {issue_key or 'Unknown'}")
+        logger.info(f"Final extracted issue key: {issue_key}")
         
         # Normalize webhook data
         webhook_payload = WebhookPayload(
@@ -291,18 +222,21 @@ async def jira_hook(request: Request):
         )
         
     except Exception as e:
-        logger.error(f"❌ Invalid webhook data: {e}")
+        logger.error(f"Invalid webhook data: {e}")
         raise HTTPException(status_code=400, detail="Invalid webhook data")
     
     # Queue for background processing
     jobs.put(webhook_payload.dict())
-    logger.info(f"📋 Job queued for background processing (queue size: {jobs.qsize()})")
+    logger.info(f"Job queued for unified agent processing (queue size: {jobs.qsize()})")
     
     # Return immediate response to keep Jira happy
+    available_tools_count = len(unified_agent.available_tools) if unified_agent else 0
     return {
         "received": True,
         "issueKey": issue_key,
         "queued": True,
+        "agent_mode": "unified" if unified_agent else "failed",
+        "available_tools": available_tools_count,
         "queue_size": jobs.qsize(),
         "timestamp": datetime.now().isoformat()
     }
@@ -310,17 +244,43 @@ async def jira_hook(request: Request):
 @app.get("/")
 async def root():
     """Root endpoint"""
+    available_tools_count = len(unified_agent.available_tools) if unified_agent else 0
+    agent_status = "running" if unified_agent else "failed"
+    
     return {
         "service": "Jira AI Agent", 
-        "version": "2.0.0",
-        "status": "running",
+        "version": "3.0.0",
+        "status": agent_status,
+        "agent_mode": "unified" if unified_agent else "failed",
+        "available_tools": available_tools_count,
         "endpoints": {
             "webhook": "/jira-hook",
             "health": "/health", 
+            "tools": "/tools",
             "debug_config": "/debug/config",
-            "debug_extraction": "/debug/extraction",
             "test_ollama": "/test/ollama"
         }
+    }
+
+@app.get("/tools")
+async def list_tools():
+    """List all available tools the agent can use"""
+    if config.production:
+        raise HTTPException(status_code=404, detail="Not found")
+    
+    if unified_agent is None:
+        return {"total_tools": 0, "tools": {}, "error": "Unified agent not initialized"}
+    
+    tools_info = {}
+    for name, info in unified_agent.available_tools.items():
+        tools_info[name] = {
+            "description": info["description"],
+            "parameters": info["parameters"]
+        }
+    
+    return {
+        "total_tools": len(tools_info),
+        "tools": tools_info
     }
 
 @app.get("/health")
@@ -336,9 +296,13 @@ async def health_check():
         except:
             jira_status = "failed"
     
+    available_tools_count = len(unified_agent.available_tools) if unified_agent else 0
+    
     return {
         "status": "healthy",
-        "version": "2.0.0",
+        "version": "3.0.0",
+        "agent_mode": "unified" if unified_agent else "failed",
+        "available_tools": available_tools_count,
         "queue_size": jobs.qsize(),
         "jira_status": jira_status,
         "model": config.model,
@@ -352,28 +316,19 @@ async def debug_config():
     if config.production:
         raise HTTPException(status_code=404, detail="Not found")
     
+    available_tools_count = len(unified_agent.available_tools) if unified_agent else 0
+    tool_names = list(unified_agent.available_tools.keys()) if unified_agent else []
+    
     return {
         "jira_configured": bool(config.jira_api_token or config.jira_bearer_token),
         "jira_base_url": config.jira_base_url,
         "model": config.model,
         "ollama_url": config.ollama_url,
-        "production": config.production
+        "production": config.production,
+        "unified_agent_status": "initialized" if unified_agent else "failed",
+        "available_tools": available_tools_count,
+        "tool_names": tool_names
     }
-
-@app.get("/debug/extraction")
-async def debug_extraction():
-    """Debug field extraction (development only)"""
-    if config.production:
-        raise HTTPException(status_code=404, detail="Not found")
-    
-    from jira.field_extractor import extract_field_details
-    
-    # Test with sample data
-    summary = "Create custom field called Banana Ripeness Level"
-    description = "Need a select list with Unripe, Ripe, Overripe options for our fruit tracking project"
-    
-    result = extract_field_details(summary, description)
-    return result
 
 @app.get("/test/ollama")
 async def test_ollama():
@@ -393,11 +348,62 @@ async def test_ollama():
             "suggestion": "Check if Ollama is running: ollama serve"
         }
 
+@app.post("/test/unified")
+async def test_unified_agent():
+    """Test the unified agent with a sample request"""
+    if config.production:
+        raise HTTPException(status_code=404, detail="Not found")
+    
+    if unified_agent is None:
+        return {
+            "test_status": "failed",
+            "error": "Unified agent not initialized"
+        }
+    
+    # Test issue
+    test_issue = {
+        "key": "TEST-123",
+        "fields": {
+            "summary": "Test unified agent capabilities",
+            "description": {
+                "type": "doc",
+                "version": 1,
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "This is a test to see what the unified agent can do with all available Jira tools."
+                            }
+                        ]
+                    }
+                ]
+            },
+            "status": {"name": "To Do"},
+            "assignee": None,
+            "labels": []
+        }
+    }
+    
+    try:
+        result = unified_agent.process(test_issue)
+        return {
+            "test_status": "completed",
+            "result": result
+        }
+    except Exception as e:
+        return {
+            "test_status": "failed", 
+            "error": str(e)
+        }
+
 if __name__ == "__main__":
     import uvicorn
     
-    logger.info("🚀 Starting Jira AI Agent...")
-    logger.info(f"📊 Configuration: {config}")
+    logger.info("Starting Unified Jira AI Agent...")
+    logger.info(f"Configuration: {config}")
+    logger.info(f"Discovered {len(unified_agent.available_tools)} Jira API tools")
     
     # Run with development settings
     uvicorn.run(

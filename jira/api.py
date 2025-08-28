@@ -18,7 +18,7 @@ class JiraAPI:
 
         # Auth selection: prefer Cloud Basic when email+api_token present.
         if self.email and self.api_token:
-            print("🔐 Using Basic Auth (email + API token)")
+            print("Using Basic Auth (email + API token)")
             credentials = base64.b64encode(f"{self.email}:{self.api_token}".encode()).decode()
             self.session.headers.update({
                 "Authorization": f"Basic {credentials}",
@@ -27,7 +27,7 @@ class JiraAPI:
                 "User-Agent": "Jira-AI-Bot/1.0",
             })
         elif self.bearer_token:
-            print("🔐 Using Bearer Token Auth (Server/DC PAT)")
+            print("Using Bearer Token Auth (Server/DC PAT)")
             self.session.headers.update({
                 "Authorization": f"Bearer {self.bearer_token}",
                 "Accept": "application/json",
@@ -35,14 +35,14 @@ class JiraAPI:
                 "User-Agent": "Jira-AI-Bot/1.0",
             })
         else:
-            print("⚠️  No authentication configured")
+            print("No authentication configured")
 
         # Optional: quick probe to make /health reliable during setup
         try:
             r = self.session.get(f"{self.base_url}/rest/api/3/myself", timeout=10)
-            print(f"🧪 Jira probe /myself → {r.status_code}")
+            print(f"Jira probe /myself → {r.status_code}")
         except Exception as e:
-            print(f"🧪 Jira probe error: {e}")
+            print(f"Jira probe error: {e}")
 
     def test_connection(self) -> Dict:
         """Test API connection"""
@@ -50,20 +50,46 @@ class JiraAPI:
             response = self.session.get(f"{self.base_url}/rest/api/3/myself")
             if response.status_code == 200:
                 user_data = response.json()
-                print(f"✅ Connected to Jira as: {user_data.get('displayName', 'Unknown')}")
+                print(f"Connected to Jira as: {user_data.get('displayName', 'Unknown')}")
                 return {"success": True, "user": user_data}
             else:
-                print(f"❌ Connection test failed: {response.status_code}")
+                print(f"Connection test failed: {response.status_code}")
                 return {"error": f"HTTP {response.status_code}", "body": response.text[:300]}
         except Exception as e:
-            print(f"❌ Connection test failed: {e}")
+            print(f"Connection test failed: {e}")
+            return {"error": str(e)}
+
+    def get_issue(self, issue_key: str) -> Dict:
+        """Get issue details"""
+        try:
+            response = self.session.get(f"{self.base_url}/rest/api/3/issue/{issue_key}")
+            if response.status_code == 200:
+                return response.json()
+            else:
+                return {"error": f"HTTP {response.status_code}: {response.text[:300]}"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def update_issue(self, issue_key: str, fields: Dict) -> Dict:
+        """Update issue fields"""
+        try:
+            payload = {"fields": fields}
+            response = self.session.put(f"{self.base_url}/rest/api/3/issue/{issue_key}", json=payload)
+            
+            if response.status_code == 204:  # No content response for successful updates
+                return {"success": True}
+            elif response.status_code == 200:
+                return {"success": True, "data": response.json()}
+            else:
+                return {"error": f"HTTP {response.status_code}: {response.text[:300]}"}
+        except Exception as e:
             return {"error": str(e)}
 
     def get_all_custom_fields(self) -> Dict:
         """Get all custom fields in the Jira instance"""
         try:
             url = f"{self.base_url}/rest/api/3/field"
-            print("🔍 Fetching all custom fields...")
+            print("Fetching all custom fields...")
 
             response = self.session.get(url)
             response.raise_for_status()
@@ -71,11 +97,11 @@ class JiraAPI:
             fields = response.json()
             custom_fields = [f for f in fields if f.get("custom", False)]
 
-            print(f"📊 Found {len(custom_fields)} custom fields in Jira")
+            print(f"Found {len(custom_fields)} custom fields in Jira")
             return {"success": True, "fields": custom_fields}
 
         except Exception as e:
-            print(f"❌ Failed to fetch custom fields: {e}")
+            print(f"Failed to fetch custom fields: {e}")
             return {"error": str(e)}
 
     def check_duplicate_field(self, field_name: str) -> Dict:
@@ -115,7 +141,7 @@ class JiraAPI:
             }
 
         except Exception as e:
-            print(f"❌ Failed to check duplicates: {e}")
+            print(f"Failed to check duplicates: {e}")
             return {"error": str(e)}
 
     def create_custom_field(self, field_name: str, field_type: str,
@@ -147,7 +173,7 @@ class JiraAPI:
             elif "number" in jira_field_type or "float" in jira_field_type:
                 payload["searcherKey"] = "com.atlassian.jira.plugin.system.customfieldtypes:exactnumber"
 
-            print(f"🛠️  Creating custom field: {field_name}")
+            print(f"Creating custom field: {field_name}")
             print(f"   Type: {jira_field_type}")
 
             url = f"{self.base_url}/rest/api/3/field"
@@ -156,27 +182,27 @@ class JiraAPI:
             if response.status_code == 201:
                 field_data = response.json()
                 field_id = field_data.get("id")
-                print(f"✅ Field created successfully! ID: {field_id}")
+                print(f"Field created successfully! ID: {field_id}")
 
                 if options and "select" in jira_field_type and field_id:
-                    print(f"🎚️  Adding {len(options)} options to select field...")
+                    print(f"Adding {len(options)} options to select field...")
                     options_result = self.add_field_options(field_id, options)
                     field_data["options_result"] = options_result
 
                 return {"success": True, "field": field_data}
             else:
-                print(f"❌ Field creation failed: {response.status_code}")
+                print(f"Field creation failed: {response.status_code}")
                 return {"error": f"HTTP {response.status_code}: {response.text[:300]}"}
 
         except Exception as e:
-            print(f"❌ Field creation error: {e}")
+            print(f"Field creation error: {e}")
             return {"error": str(e)}
 
     def add_field_options(self, field_id: str, options: List[str]) -> Dict:
         """Add options to a select/multiselect custom field"""
         try:
             config_url = f"{self.base_url}/rest/api/3/field/{field_id}/contexts"
-            print(f"🔍 Getting field contexts for {field_id}...")
+            print(f"Getting field contexts for {field_id}...")
 
             config_response = self.session.get(config_url)
             if config_response.status_code != 200:
@@ -187,7 +213,7 @@ class JiraAPI:
                 return {"error": "No field contexts found"}
 
             context_id = contexts["values"][0]["id"]
-            print(f"📋 Using context ID: {context_id}")
+            print(f"Using context ID: {context_id}")
 
             options_url = f"{self.base_url}/rest/api/3/field/{field_id}/context/{context_id}/option"
 
@@ -201,9 +227,9 @@ class JiraAPI:
                 if response.status_code == 201:
                     option_data = response.json()
                     created_options.extend(option_data.get("options", []))
-                    print(f"   ✅ Option '{option_value}' added")
+                    print(f"   Option '{option_value}' added")
                 else:
-                    print(f"   ❌ Failed to add option '{option_value}'")
+                    print(f"   Failed to add option '{option_value}'")
 
             return {
                 "success": True,
@@ -213,7 +239,7 @@ class JiraAPI:
             }
 
         except Exception as e:
-            print(f"❌ Options creation error: {e}")
+            print(f"Options creation error: {e}")
             return {"error": str(e)}
 
     def add_comment(self, issue_key: str, comment: str) -> Dict:
@@ -233,17 +259,17 @@ class JiraAPI:
             }
 
             url = f"{self.base_url}/rest/api/3/issue/{issue_key}/comment"
-            print(f"💬 Adding comment to {issue_key}...")
+            print(f"Adding comment to {issue_key}...")
 
             response = self.session.post(url, json=payload)
 
             if response.status_code == 201:
-                print("✅ Comment added successfully!")
+                print("Comment added successfully!")
                 return {"success": True, "comment_id": response.json().get("id")}
             else:
-                print(f"❌ Comment failed: {response.status_code}")
+                print(f"Comment failed: {response.status_code}")
                 return {"error": f"HTTP {response.status_code}: {response.text[:300]}"}
 
         except Exception as e:
-            print(f"❌ Comment error: {e}")
+            print(f"Comment error: {e}")
             return {"error": str(e)}
