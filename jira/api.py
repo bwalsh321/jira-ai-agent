@@ -5,6 +5,9 @@ Jira API Client - All Jira REST operations
 import base64
 from typing import Dict, List, Optional
 
+import logging
+logger = logging.getLogger(__name__)
+
 import requests
 
 
@@ -242,34 +245,69 @@ class JiraAPI:
             print(f"Options creation error: {e}")
             return {"error": str(e)}
 
-    def add_comment(self, issue_key: str, comment: str) -> Dict:
-        """Add comment to issue"""
+    def add_comment(self, issue_key: str, comment) -> Dict:
+        """Add comment to issue - supports both string and ADF format"""
         try:
-            payload = {
-                "body": {
-                    "type": "doc",
-                    "version": 1,
-                    "content": [
-                        {
-                            "type": "paragraph",
-                            "content": [{"type": "text", "text": comment}],
-                        }
-                    ],
-                }
-            }
-
             url = f"{self.base_url}/rest/api/3/issue/{issue_key}/comment"
-            print(f"Adding comment to {issue_key}...")
-
+            
+            # Handle both string and ADF payload formats
+            if isinstance(comment, str):
+                # String format - convert to ADF
+                payload = {
+                    "body": {
+                        "type": "doc",
+                        "version": 1,
+                        "content": [
+                            {
+                                "type": "paragraph",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": comment
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                }
+            else:
+                # Already ADF format
+                payload = comment
+            
             response = self.session.post(url, json=payload)
-
+            
             if response.status_code == 201:
-                print("Comment added successfully!")
+                logger.info(f"Comment added successfully!")
                 return {"success": True, "comment_id": response.json().get("id")}
             else:
-                print(f"Comment failed: {response.status_code}")
-                return {"error": f"HTTP {response.status_code}: {response.text[:300]}"}
-
+                logger.error(f"Comment failed: {response.text[:500]}")
+                return {"error": f"HTTP {response.status_code}: {response.text[:200]}"}
+                
         except Exception as e:
-            print(f"Comment error: {e}")
+            logger.error(f"Comment error: {e}")
+            return {"error": str(e)}
+
+    def search_issues(self, jql: str, max_results: int = 50) -> Dict:
+        """Search issues using JQL"""
+        try:
+            url = f"{self.base_url}/rest/api/3/search"
+            
+            payload = {
+                "jql": jql,
+                "maxResults": max_results,
+                "fields": ["summary", "description", "issuetype", "priority", "created", "status", "reporter"]
+            }
+            
+            logger.info(f"JQL search: {jql}")
+            
+            response = self.session.post(url, json=payload)
+            response.raise_for_status()
+            
+            result = response.json()
+            logger.info(f"Found {result.get('total', 0)} issues")
+            
+            return {"success": True, "issues": result.get("issues", []), "total": result.get("total", 0)}
+            
+        except Exception as e:
+            logger.error(f"JQL search failed: {e}")
             return {"error": str(e)}
