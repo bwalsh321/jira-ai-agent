@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Jira AI Agent - Fixed Direct Routing
+Jira AI Agent - Complete Multi-Agent System
 Each agent gets its own endpoint, standardized interface
 """
 
@@ -22,6 +22,10 @@ from utils.logger import setup_logger
 
 # Import available agents
 from agents.l1_triage_bot import L1TriageBot
+from agents.admin_validator import UnrestrictedJiraAgent
+from agents.pm_enhancer import PMEnhancer
+from agents.governance_bot import GovernanceBot
+# Note: planner.py has functions, not a class - we'll skip it for now
 
 # Initialize config and logger
 config = get_config()
@@ -31,7 +35,7 @@ logger = setup_logger(__name__)
 app = FastAPI(
     title="Jira AI Agent Toolkit",
     description="Direct routing to specialized Jira agents",
-    version="3.1.0",
+    version="3.2.0",
     docs_url=None if config.production else "/docs",
     redoc_url=None if config.production else "/redoc"
 )
@@ -42,14 +46,23 @@ jobs = queue.Queue()
 # Initialize available agents
 available_agents = {}
 
-try:
-    logger.info("Initializing L1 Triage Agent...")
-    available_agents["l1_triage"] = L1TriageBot(config)
-    logger.info("L1 Triage Agent initialized successfully")
-except Exception as e:
-    logger.error(f"Failed to initialize L1 Triage Agent: {e}")
-    import traceback
-    logger.error(f"Full traceback: {traceback.format_exc()}")
+# Initialize all agents with error handling
+agent_configs = [
+    ("l1_triage", L1TriageBot, "L1 Triage Agent"),
+    ("admin_validator", UnrestrictedJiraAgent, "Admin Validator Agent"),
+    ("pm_enhancer", PMEnhancer, "PM Enhancer Agent"),
+    ("governance_bot", GovernanceBot, "Governance Bot Agent")
+]
+
+for agent_key, agent_class, agent_name in agent_configs:
+    try:
+        logger.info(f"Initializing {agent_name}...")
+        available_agents[agent_key] = agent_class(config)
+        logger.info(f"{agent_name} initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize {agent_name}: {e}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
 
 logger.info(f"Initialized {len(available_agents)} agents: {list(available_agents.keys())}")
 
@@ -134,9 +147,21 @@ def process_with_agent(agent_name: str, payload: WebhookPayload) -> Dict:
         # Build full issue context
         context = build_full_issue_context(payload)
         
-        # Process with agent
+        # Try process_ticket first (newer interface), fallback to process
         agent = available_agents[agent_name]
-        result = agent.process_ticket(payload.issueKey, context)
+        try:
+            if hasattr(agent, 'process_ticket'):
+                result = agent.process_ticket(payload.issueKey, context)
+            elif hasattr(agent, 'process'):
+                result = agent.process(context)
+            else:
+                return {
+                    "error": f"Agent {agent_name} has no process method",
+                    "issueKey": payload.issueKey
+                }
+        except AttributeError:
+            # Fallback for older agents
+            result = agent.process(context)
         
         logger.info(f"Agent {agent_name} processed {payload.issueKey}: {result.get('result', 'unknown')}")
         return result
@@ -187,6 +212,44 @@ def worker_loop():
 # Start background worker
 threading.Thread(target=worker_loop, daemon=True).start()
 
+# ========================= HELPER FUNCTION FOR WEBHOOK DATA =========================
+
+def extract_webhook_data(body: Dict) -> Dict:
+    """Extract standardized webhook data from Jira webhook body"""
+    webhook_data = {}
+    
+    if "issue" in body:
+        # Jira webhook format
+        issue = body["issue"]
+        webhook_data = {
+            "issueKey": issue["key"],
+            "summary": issue["fields"]["summary"],
+            "issueType": issue["fields"]["issuetype"]["name"],
+            "issue": issue,
+            "raw_data": body
+        }
+        
+        # Extract description
+        desc_obj = issue["fields"].get("description")
+        if desc_obj and isinstance(desc_obj, dict) and "content" in desc_obj:
+            description = ""
+            for block in desc_obj.get("content", []):
+                if block.get("type") == "paragraph":
+                    for content in block.get("content", []):
+                        if content.get("type") == "text":
+                            description += content.get("text", "")
+            webhook_data["description"] = description
+        
+        # Extract request type if available
+        request_type_field = issue["fields"].get("customfield_10010")
+        if request_type_field and isinstance(request_type_field, dict):
+            webhook_data["requestType"] = request_type_field.get("requestType", {}).get("name", "")
+    else:
+        # Direct payload format
+        webhook_data = body
+    
+    return webhook_data
+
 # ========================= AGENT ENDPOINTS =========================
 
 @app.post("/agents/l1-triage")
@@ -202,35 +265,9 @@ async def l1_triage_webhook(request: Request):
     
     try:
         body = await request.json()
-        logger.info(f"L1 Triage webhook received: {json.dumps(body, indent=2)[:200]}...")
+        logger.info(f"L1 Triage webhook received")
         
-        # Handle both direct webhook data and nested issue data
-        webhook_data = {}
-        if "issue" in body:
-            # Jira webhook format
-            issue = body["issue"]
-            webhook_data = {
-                "issueKey": issue["key"],
-                "summary": issue["fields"]["summary"],
-                "issueType": issue["fields"]["issuetype"]["name"],
-                "issue": issue,
-                "raw_data": body
-            }
-            
-            # Extract description
-            desc_obj = issue["fields"].get("description")
-            if desc_obj and isinstance(desc_obj, dict) and "content" in desc_obj:
-                description = ""
-                for block in desc_obj.get("content", []):
-                    if block.get("type") == "paragraph":
-                        for content in block.get("content", []):
-                            if content.get("type") == "text":
-                                description += content.get("text", "")
-                webhook_data["description"] = description
-        else:
-            # Direct payload format
-            webhook_data = body
-        
+        webhook_data = extract_webhook_data(body)
         payload = WebhookPayload(**webhook_data)
         
         # Queue for background processing
@@ -249,8 +286,144 @@ async def l1_triage_webhook(request: Request):
         
     except Exception as e:
         logger.error(f"L1 triage webhook error: {e}")
-        import traceback
-        logger.error(f"Full traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/agents/custom-field-creator")
+async def custom_field_creator_webhook(request: Request):
+    """Custom Field Creation Agent
+    
+    Use this for:
+    - "New Custom Field" requests
+    - Field configuration requests
+    """
+    verify_webhook_secret(request)
+    
+    try:
+        body = await request.json()
+        logger.info(f"Custom Field Creator webhook received")
+        
+        webhook_data = extract_webhook_data(body)
+        payload = WebhookPayload(**webhook_data)
+        
+        jobs.put({
+            "agent_name": "admin_validator",
+            "payload": payload.dict()
+        })
+        
+        return {
+            "received": True,
+            "agent": "admin_validator",
+            "issueKey": payload.issueKey,
+            "queued": True,
+            "queue_size": jobs.qsize()
+        }
+        
+    except Exception as e:
+        logger.error(f"Custom field creator webhook error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/agents/pm-enhancer")
+async def pm_enhancer_webhook(request: Request):
+    """PM Ticket Enhancement Agent
+    
+    Use this for:
+    - Converting meeting notes to user stories
+    - Adding acceptance criteria
+    - Manual ticket cleanup
+    """
+    verify_webhook_secret(request)
+    
+    try:
+        body = await request.json()
+        logger.info(f"PM Enhancer webhook received")
+        
+        webhook_data = extract_webhook_data(body)
+        payload = WebhookPayload(**webhook_data)
+        
+        jobs.put({
+            "agent_name": "pm_enhancer",
+            "payload": payload.dict()
+        })
+        
+        return {
+            "received": True,
+            "agent": "pm_enhancer",
+            "issueKey": payload.issueKey,
+            "queued": True,
+            "queue_size": jobs.qsize()
+        }
+        
+    except Exception as e:
+        logger.error(f"PM enhancer webhook error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/agents/governance-bot")
+async def governance_bot_webhook(request: Request):
+    """Governance/Housekeeping Agent
+    
+    Use this for:
+    - Scheduled cleanup tasks
+    - Stale ticket management
+    - Policy enforcement
+    """
+    verify_webhook_secret(request)
+    
+    try:
+        body = await request.json()
+        logger.info(f"Governance Bot webhook received")
+        
+        webhook_data = extract_webhook_data(body)
+        payload = WebhookPayload(**webhook_data)
+        
+        jobs.put({
+            "agent_name": "governance_bot",
+            "payload": payload.dict()
+        })
+        
+        return {
+            "received": True,
+            "agent": "governance_bot",
+            "issueKey": payload.issueKey,
+            "queued": True,
+            "queue_size": jobs.qsize()
+        }
+        
+    except Exception as e:
+        logger.error(f"Governance bot webhook error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/agents/planner")
+async def planner_webhook(request: Request):
+    """Smart Planner Agent
+    
+    Use this for:
+    - Auto-routing complex requests
+    - Multi-step workflow planning
+    """
+    verify_webhook_secret(request)
+    
+    try:
+        body = await request.json()
+        logger.info(f"Planner webhook received")
+        
+        webhook_data = extract_webhook_data(body)
+        payload = WebhookPayload(**webhook_data)
+        
+        jobs.put({
+            "agent_name": "planner",
+            "payload": payload.dict()
+        })
+        
+        return {
+            "received": True,
+            "agent": "planner",
+            "issueKey": payload.issueKey,
+            "queued": True,
+            "queue_size": jobs.qsize()
+        }
+        
+    except Exception as e:
+        logger.error(f"Planner webhook error: {e}")
         raise HTTPException(status_code=400, detail=str(e))
 
 # ========================= INFO ENDPOINTS =========================
@@ -260,15 +433,36 @@ async def root():
     """Root endpoint with available agents"""
     return {
         "service": "Jira AI Agent Toolkit",
-        "version": "3.1.0", 
+        "version": "3.2.0", 
         "architecture": "direct_routing",
         "available_agents": {
             "l1_triage": {
                 "endpoint": "/agents/l1-triage",
                 "status": "active" if "l1_triage" in available_agents else "inactive",
                 "description": "Incident triage and troubleshooting guidance"
+            },
+            "custom_field_creator": {
+                "endpoint": "/agents/custom-field-creator",
+                "status": "active" if "admin_validator" in available_agents else "inactive",
+                "description": "Custom field validation and creation"
+            },
+            "pm_enhancer": {
+                "endpoint": "/agents/pm-enhancer",
+                "status": "active" if "pm_enhancer" in available_agents else "inactive",
+                "description": "Ticket enhancement and user story creation"
+            },
+            "governance_bot": {
+                "endpoint": "/agents/governance-bot",
+                "status": "active" if "governance_bot" in available_agents else "inactive",
+                "description": "Housekeeping and policy enforcement"
+            },
+            "planner": {
+                "endpoint": "/agents/planner",
+                "status": "inactive",
+                "description": "Smart routing and workflow planning (not implemented yet)"
             }
-        }
+        },
+        "total_active_agents": len(available_agents)
     }
 
 @app.get("/health")
@@ -297,8 +491,9 @@ async def health_check():
     
     return {
         "status": "healthy",
-        "version": "3.1.0",
+        "version": "3.2.0",
         "active_agents": len(available_agents),
+        "agent_list": list(available_agents.keys()),
         "queue_size": jobs.qsize(),
         "jira_status": jira_status,
         "model": config.model,
@@ -329,11 +524,38 @@ async def test_l1_triage():
         "result": result
     }
 
+@app.get("/test/all-agents")
+async def test_all_agents():
+    """Test all available agents"""
+    if hasattr(config, 'production') and config.production:
+        raise HTTPException(status_code=404, detail="Not found")
+    
+    test_payload = WebhookPayload(
+        issueKey="TEST-123",
+        summary="Test ticket for all agents",
+        description="This is a test ticket to verify all agents are working properly.",
+        issueType="Task"
+    )
+    
+    results = {}
+    for agent_name in available_agents:
+        try:
+            result = process_with_agent(agent_name, test_payload)
+            results[agent_name] = {"status": "success" if "error" not in result else "failed", "result": result}
+        except Exception as e:
+            results[agent_name] = {"status": "failed", "error": str(e)}
+    
+    return {
+        "test_summary": f"{len(available_agents)} agents tested",
+        "results": results
+    }
+
 if __name__ == "__main__":
     import uvicorn
     
-    logger.info("Starting Jira AI Agent Toolkit (Direct Routing)...")
+    logger.info("Starting Jira AI Agent Toolkit (Complete Multi-Agent System)...")
     logger.info(f"Active agents: {list(available_agents.keys())}")
+    logger.info(f"Endpoints available: /agents/{{l1-triage,custom-field-creator,pm-enhancer,governance-bot,planner}}")
     
     uvicorn.run(
         "main:app",

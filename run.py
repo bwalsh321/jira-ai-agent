@@ -3,7 +3,8 @@
 Development runner for Jira AI Agent
 Quick way to start the server with proper logging
 """
-
+from dotenv import load_dotenv
+load_dotenv(override=True)
 import uvicorn
 from config import get_config, Config
 from utils.logger import setup_logger
